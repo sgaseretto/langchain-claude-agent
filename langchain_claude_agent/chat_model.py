@@ -118,7 +118,7 @@ class ChatClaudeAgent(BaseChatModel):
         """
         return ClaudeAgentOptions(
             model=self.model,
-            system_prompt=system_prompt or self.system_prompt,
+            system_prompt=system_prompt if system_prompt is not None else self.system_prompt,
             max_turns=self.max_turns,
             max_budget_usd=self.max_budget_usd,
             allowed_tools=self.allowed_tools or [],

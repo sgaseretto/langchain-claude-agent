@@ -94,10 +94,7 @@ def convert_langchain_tool_to_sdk(lc_tool: BaseTool) -> SDKToolSpec:
         Returns:
             SDK-formatted result dict with content list.
         """
-        try:
-            result = await lc_tool.ainvoke(args)
-        except NotImplementedError:
-            result = lc_tool.invoke(args)
+        result = await lc_tool.ainvoke(args)
         return {"content": [{"type": "text", "text": str(result)}]}
 
     return SDKToolSpec(

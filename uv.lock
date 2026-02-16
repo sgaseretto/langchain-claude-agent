@@ -334,15 +334,6 @@ wheels = [
 ]
 
 [[package]]
-name = "fastcore"
-version = "1.12.14"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/92/b0/c30721504c916c871b1c3d2f209ad0fa9320a26c7e9041436e9231f3aa1d/fastcore-1.12.14.tar.gz", hash = "sha256:09190c46360c57dbba5e6b991df4b5fd6d2720ea4b4959309151d7fe6b2bf520", size = 92366, upload-time = "2026-02-14T06:54:56.272Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d0/c0/b7fa771dda08001eb004112114094370d6b94b857ed902a32472ed74a8fe/fastcore-1.12.14-py3-none-any.whl", hash = "sha256:19e5adcee3af6f357af4f66954e17f335f208bb9cb422dcdef03d2e9d586eca3", size = 96584, upload-time = "2026-02-14T06:54:54.315Z" },
-]
-
-[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -460,7 +451,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "claude-agent-sdk" },
-    { name = "fastcore" },
     { name = "langchain-core" },
     { name = "pydantic" },
 ]
@@ -475,7 +465,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "claude-agent-sdk" },
-    { name = "fastcore" },
     { name = "langchain-core", specifier = ">=0.3.0" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'" },
