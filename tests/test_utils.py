@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+from unittest.mock import patch
+
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from langchain_claude_agent._utils import (
@@ -144,3 +147,56 @@ class TestMapUsage:
         details = result["input_token_details"]
         assert details["cache_read"] == 30
         assert details["cache_creation"] == 10
+
+
+class TestCheckCredentials:
+    """Tests for check_claude_agent_sdk_credentials."""
+
+    def test_api_key_present(self):
+        """When ANTHROPIC_API_KEY is set, return success with key message."""
+        from langchain_claude_agent._utils import check_claude_agent_sdk_credentials
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test-key"}):
+            ok, msg = check_claude_agent_sdk_credentials()
+            assert ok is True
+            assert "ANTHROPIC_API_KEY" in msg
+
+    def test_bedrock_configured(self):
+        """When Bedrock env var is set, return success with Bedrock message."""
+        from langchain_claude_agent._utils import check_claude_agent_sdk_credentials
+
+        env = {"CLAUDE_CODE_USE_BEDROCK": "1"}
+        with patch.dict(os.environ, env, clear=True):
+            ok, msg = check_claude_agent_sdk_credentials()
+            assert ok is True
+            assert "Bedrock" in msg
+
+    def test_vertex_configured(self):
+        """When Vertex env var is set, return success with Vertex message."""
+        from langchain_claude_agent._utils import check_claude_agent_sdk_credentials
+
+        env = {"CLAUDE_CODE_USE_VERTEX": "1"}
+        with patch.dict(os.environ, env, clear=True):
+            ok, msg = check_claude_agent_sdk_credentials()
+            assert ok is True
+            assert "Vertex" in msg
+
+    def test_foundry_configured(self):
+        """When Foundry env var is set, return success with Foundry message."""
+        from langchain_claude_agent._utils import check_claude_agent_sdk_credentials
+
+        env = {"CLAUDE_CODE_USE_FOUNDRY": "1"}
+        with patch.dict(os.environ, env, clear=True):
+            ok, msg = check_claude_agent_sdk_credentials()
+            assert ok is True
+            assert "Foundry" in msg
+
+    def test_returns_tuple(self):
+        """Result should always be a (bool, str) tuple."""
+        from langchain_claude_agent._utils import check_claude_agent_sdk_credentials
+
+        result = check_claude_agent_sdk_credentials()
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        assert isinstance(result[0], bool)
+        assert isinstance(result[1], str)
