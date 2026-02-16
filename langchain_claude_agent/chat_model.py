@@ -179,9 +179,7 @@ class ChatClaudeAgent(BaseChatModel):
             return await self._agenerate_with_client(
                 messages, tools, stop, run_manager, **kwargs
             )
-        return await self._agenerate_with_query(
-            messages, stop, run_manager, **kwargs
-        )
+        return await self._agenerate_with_query(messages, stop, run_manager, **kwargs)
 
     async def _agenerate_with_query(
         self,
@@ -256,9 +254,9 @@ class ChatClaudeAgent(BaseChatModel):
         # Create SDK @tool decorated functions from our specs
         sdk_tools = []
         for spec in sdk_tool_specs:
-            decorated = sdk_tool_decorator(
-                spec.name, spec.description, spec.schema
-            )(spec.handler)
+            decorated = sdk_tool_decorator(spec.name, spec.description, spec.schema)(
+                spec.handler
+            )
             sdk_tools.append(decorated)
 
         # Create MCP server with the tools
@@ -267,9 +265,7 @@ class ChatClaudeAgent(BaseChatModel):
             version=MCP_SERVER_VERSION,
             tools=sdk_tools,
         )
-        tool_names = [
-            f"{TOOL_NAME_PREFIX}{spec.name}" for spec in sdk_tool_specs
-        ]
+        tool_names = [f"{TOOL_NAME_PREFIX}{spec.name}" for spec in sdk_tool_specs]
 
         # Build options with MCP server
         options = self._build_options(system_prompt)
@@ -344,9 +340,7 @@ class ChatClaudeAgent(BaseChatModel):
         """
         system_prompt, chat_messages = extract_system_message(messages)
         prompt = convert_messages_to_prompt(chat_messages)
-        options = self._build_options(
-            system_prompt, include_partial_messages=True
-        )
+        options = self._build_options(system_prompt, include_partial_messages=True)
 
         async for message in sdk_query(prompt=prompt, options=options):
             if _is_stream_event(message):
@@ -359,17 +353,13 @@ class ChatClaudeAgent(BaseChatModel):
                             message=AIMessageChunk(content=text)
                         )
                         if run_manager:
-                            await run_manager.on_llm_new_token(
-                                text, chunk=chunk
-                            )
+                            await run_manager.on_llm_new_token(text, chunk=chunk)
                         yield chunk
             elif _is_result_message(message):
                 usage = map_sdk_usage(message.usage)
                 if usage:
                     yield ChatGenerationChunk(
-                        message=AIMessageChunk(
-                            content="", usage_metadata=usage
-                        )
+                        message=AIMessageChunk(content="", usage_metadata=usage)
                     )
 
     def _stream(

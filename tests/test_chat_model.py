@@ -210,9 +210,7 @@ class TestChatClaudeAgentGenerate:
             )
             # Check that the options passed to sdk_query include the system prompt
             call_kwargs = mock_q.call_args
-            options = call_kwargs.kwargs.get("options") or call_kwargs[1].get(
-                "options"
-            )
+            options = call_kwargs.kwargs.get("options") or call_kwargs[1].get("options")
             assert options.system_prompt == "You are a pirate."
 
     @pytest.mark.asyncio
@@ -256,9 +254,7 @@ class TestChatClaudeAgentGenerate:
         ) as mock_q:
             await agent._agenerate([HumanMessage(content="Hi")])
             call_kwargs = mock_q.call_args
-            options = call_kwargs.kwargs.get("options") or call_kwargs[1].get(
-                "options"
-            )
+            options = call_kwargs.kwargs.get("options") or call_kwargs[1].get("options")
             assert options.system_prompt == "default system"
 
     @pytest.mark.asyncio
@@ -283,9 +279,7 @@ class TestChatClaudeAgentGenerate:
                 ]
             )
             call_kwargs = mock_q.call_args
-            options = call_kwargs.kwargs.get("options") or call_kwargs[1].get(
-                "options"
-            )
+            options = call_kwargs.kwargs.get("options") or call_kwargs[1].get("options")
             assert options.system_prompt == "override system"
 
     @pytest.mark.asyncio
@@ -529,9 +523,7 @@ class TestChatClaudeAgentStream:
             yield _make_stream_event("Once ")
             yield _make_stream_event("upon ")
             yield _make_stream_event("a time")
-            yield _make_result_message(
-                usage={"input_tokens": 10, "output_tokens": 6}
-            )
+            yield _make_result_message(usage={"input_tokens": 10, "output_tokens": 6})
 
         with patch("langchain_claude_agent.chat_model.sdk_query", mock_query):
             chunks = []
@@ -553,9 +545,7 @@ class TestChatClaudeAgentStream:
 
         async def mock_query(*args, **kwargs):
             yield _make_stream_event("hi")
-            yield _make_result_message(
-                usage={"input_tokens": 50, "output_tokens": 25}
-            )
+            yield _make_result_message(usage={"input_tokens": 50, "output_tokens": 25})
 
         with patch("langchain_claude_agent.chat_model.sdk_query", mock_query):
             chunks = []
