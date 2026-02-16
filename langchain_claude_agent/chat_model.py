@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Optional
 
-from claude_agent_sdk import ClaudeAgentOptions
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, create_sdk_mcp_server
 from claude_agent_sdk import query as sdk_query
+from claude_agent_sdk import tool as sdk_tool_decorator
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
     CallbackManagerForLLMRun,
@@ -14,8 +15,16 @@ from langchain_core.callbacks import (
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.runnables import Runnable
 
-from langchain_claude_agent._types import DEFAULT_MODEL, DEFAULT_PERMISSION_MODE
+from langchain_claude_agent._tool_converter import convert_langchain_tools
+from langchain_claude_agent._types import (
+    DEFAULT_MODEL,
+    DEFAULT_PERMISSION_MODE,
+    MCP_SERVER_NAME,
+    MCP_SERVER_VERSION,
+    TOOL_NAME_PREFIX,
+)
 from langchain_claude_agent._utils import (
     convert_messages_to_prompt,
     extract_system_message,
@@ -107,6 +116,29 @@ class ChatClaudeAgent(BaseChatModel):
         )
 
     # --------------------------------------------------------------------- #
+    # Tool binding
+    # --------------------------------------------------------------------- #
+
+    def bind_tools(
+        self,
+        tools: list,
+        *,
+        tool_choice: str | None = None,
+        **kwargs: Any,
+    ) -> Runnable:
+        """Bind LangChain tools for autonomous SDK execution.
+
+        Args:
+            tools: List of LangChain tool instances.
+            tool_choice: Not used (SDK handles tool selection autonomously).
+            **kwargs: Additional arguments passed to bind().
+
+        Returns:
+            A Runnable with tools stored in kwargs.
+        """
+        return self.bind(tools=tools, **kwargs)
+
+    # --------------------------------------------------------------------- #
     # Async generation
     # --------------------------------------------------------------------- #
 
@@ -183,26 +215,74 @@ class ChatClaudeAgent(BaseChatModel):
     async def _agenerate_with_client(
         self,
         messages: list[BaseMessage],
-        tools: Any,
+        tools: list,
         stop: Optional[list[str]] = None,
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> ChatResult:
-        """Generate a response using the SDK client with tool calling.
+        """Generate using ClaudeSDKClient with bound tools.
+
+        Converts LangChain tools to SDK MCP tools, creates an MCP server,
+        and runs a ClaudeSDKClient session to get the response.
 
         Args:
-            messages: LangChain messages forming the conversation.
-            tools: Tool definitions to bind.
-            stop: Optional stop sequences.
-            run_manager: LangChain async callback manager.
-            **kwargs: Extra keyword arguments.
+            messages: LangChain messages.
+            tools: LangChain tool instances to convert and bind.
+            stop: Stop sequences.
+            run_manager: Callback manager.
+            **kwargs: Extra arguments.
 
-        Raises:
-            NotImplementedError: Always -- this path is not yet implemented.
+        Returns:
+            ChatResult with AIMessage.
         """
-        raise NotImplementedError(
-            "Tool calling via ClaudeSDKClient not yet implemented"
+        system_prompt, chat_messages = extract_system_message(messages)
+        prompt = convert_messages_to_prompt(chat_messages)
+
+        # Convert LangChain tools to SDK tool specs
+        sdk_tool_specs = convert_langchain_tools(tools)
+
+        # Create SDK @tool decorated functions from our specs
+        sdk_tools = []
+        for spec in sdk_tool_specs:
+            decorated = sdk_tool_decorator(
+                spec.name, spec.description, spec.schema
+            )(spec.handler)
+            sdk_tools.append(decorated)
+
+        # Create MCP server with the tools
+        mcp_server = create_sdk_mcp_server(
+            name=MCP_SERVER_NAME,
+            version=MCP_SERVER_VERSION,
+            tools=sdk_tools,
         )
+        tool_names = [
+            f"{TOOL_NAME_PREFIX}{spec.name}" for spec in sdk_tool_specs
+        ]
+
+        # Build options with MCP server
+        options = self._build_options(system_prompt)
+        options.mcp_servers = {MCP_SERVER_NAME: mcp_server}
+        options.allowed_tools = tool_names + (self.allowed_tools or [])
+
+        result_text = ""
+        usage_data: dict = {}
+
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(prompt)
+            async for message in client.receive_response():
+                if _is_assistant_message(message):
+                    for block in message.content:
+                        if hasattr(block, "text"):
+                            result_text += block.text
+                elif _is_result_message(message):
+                    usage_data = message.usage or {}
+
+        ai_msg = AIMessage(
+            content=result_text,
+            usage_metadata=map_sdk_usage(usage_data),
+            response_metadata={"model": self.model},
+        )
+        return ChatResult(generations=[ChatGeneration(message=ai_msg)])
 
     # --------------------------------------------------------------------- #
     # Sync generation

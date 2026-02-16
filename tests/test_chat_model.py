@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.tools import tool as lc_tool
 
 from langchain_claude_agent.chat_model import ChatClaudeAgent
 
@@ -318,17 +319,143 @@ class TestChatClaudeAgentGenerate:
 
 
 class TestChatClaudeAgentWithClient:
-    """Tests for the client path (tool calling stub)."""
+    """Tests for the client path (tool calling)."""
 
     @pytest.mark.asyncio
-    async def test_agenerate_with_tools_raises(self):
-        """Passing tools should raise NotImplementedError for now."""
+    async def test_agenerate_with_tools_uses_client_path(self):
+        """Passing tools should route to _agenerate_with_client."""
         agent = ChatClaudeAgent()
-        with pytest.raises(NotImplementedError, match="not yet implemented"):
-            await agent._agenerate(
-                [HumanMessage(content="Hi")],
-                tools=[{"name": "foo"}],
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        async def mock_receive():
+            yield _make_assistant_message("client response")
+            yield _make_result_message()
+
+        mock_client.receive_response = mock_receive
+
+        with patch(
+            "langchain_claude_agent.chat_model.ClaudeSDKClient",
+            return_value=mock_client,
+        ):
+            with patch(
+                "langchain_claude_agent.chat_model.sdk_tool_decorator",
+                side_effect=lambda n, d, s: lambda fn: fn,
+            ):
+                with patch(
+                    "langchain_claude_agent.chat_model.create_sdk_mcp_server",
+                    return_value=MagicMock(),
+                ):
+                    result = await agent._agenerate(
+                        [HumanMessage(content="Hi")],
+                        tools=[MagicMock(spec=["name", "description", "args_schema"])],
+                    )
+
+        assert "client response" in result.generations[0].message.content
+
+
+# ---------------------------------------------------------------------------
+# TestChatClaudeAgentSync
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# TestChatClaudeAgentTools
+# ---------------------------------------------------------------------------
+
+
+@lc_tool
+def add(a: int, b: int) -> int:
+    """Add two integers."""
+    return a + b
+
+
+class TestChatClaudeAgentTools:
+    """Tests for bind_tools and tool calling."""
+
+    def test_bind_tools_returns_runnable(self):
+        """bind_tools should return a Runnable with invoke/ainvoke."""
+        llm = ChatClaudeAgent()
+        bound = llm.bind_tools([add])
+        assert hasattr(bound, "invoke")
+        assert hasattr(bound, "ainvoke")
+
+    def test_bind_tools_stores_tools_in_kwargs(self):
+        """bind_tools should store tools in the RunnableBinding kwargs."""
+        llm = ChatClaudeAgent()
+        bound = llm.bind_tools([add])
+        assert "tools" in bound.kwargs
+        assert bound.kwargs["tools"] == [add]
+
+    @pytest.mark.asyncio
+    async def test_agenerate_with_tools_uses_client(self):
+        """_agenerate with tools should route through ClaudeSDKClient."""
+        llm = ChatClaudeAgent()
+        messages = [HumanMessage(content="What is 3 + 4?")]
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        async def mock_receive():
+            yield _make_assistant_message("The sum of 3 and 4 is 7.")
+            yield _make_result_message()
+
+        mock_client.receive_response = mock_receive
+
+        with patch(
+            "langchain_claude_agent.chat_model.ClaudeSDKClient",
+            return_value=mock_client,
+        ):
+            with patch(
+                "langchain_claude_agent.chat_model.sdk_tool_decorator",
+                side_effect=lambda n, d, s: lambda fn: fn,
+            ):
+                with patch(
+                    "langchain_claude_agent.chat_model.create_sdk_mcp_server",
+                    return_value=MagicMock(),
+                ):
+                    result = await llm._agenerate(messages, tools=[add])
+
+        assert "7" in result.generations[0].message.content
+
+    @pytest.mark.asyncio
+    async def test_agenerate_with_tools_returns_usage(self):
+        """_agenerate with tools should propagate usage metadata."""
+        llm = ChatClaudeAgent()
+        messages = [HumanMessage(content="What is 3 + 4?")]
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        async def mock_receive():
+            yield _make_assistant_message("7")
+            yield _make_result_message(
+                usage={"input_tokens": 200, "output_tokens": 100}
             )
+
+        mock_client.receive_response = mock_receive
+
+        with patch(
+            "langchain_claude_agent.chat_model.ClaudeSDKClient",
+            return_value=mock_client,
+        ):
+            with patch(
+                "langchain_claude_agent.chat_model.sdk_tool_decorator",
+                side_effect=lambda n, d, s: lambda fn: fn,
+            ):
+                with patch(
+                    "langchain_claude_agent.chat_model.create_sdk_mcp_server",
+                    return_value=MagicMock(),
+                ):
+                    result = await llm._agenerate(messages, tools=[add])
+
+        ai_msg = result.generations[0].message
+        assert ai_msg.usage_metadata["input_tokens"] == 200
+        assert ai_msg.usage_metadata["output_tokens"] == 100
 
 
 # ---------------------------------------------------------------------------
