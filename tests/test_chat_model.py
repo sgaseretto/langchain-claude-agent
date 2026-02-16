@@ -59,6 +59,30 @@ def _make_result_message(
     return msg
 
 
+def _make_stream_event(text: str) -> MagicMock:
+    """Create a mock SDK StreamEvent with text delta.
+
+    Args:
+        text: The text content for the text_delta event.
+
+    Returns:
+        A MagicMock whose ``event`` attribute is a dict with
+        ``content_block_delta`` type, and whose ``content``, ``usage``,
+        and ``subtype`` attributes are removed to avoid duck-typing
+        misclassification.
+    """
+    evt = MagicMock()
+    evt.event = {
+        "type": "content_block_delta",
+        "delta": {"type": "text_delta", "text": text},
+    }
+    # Remove default MagicMock attrs that would confuse duck typing
+    del evt.content
+    del evt.usage
+    del evt.subtype
+    return evt
+
+
 # ---------------------------------------------------------------------------
 # TestChatClaudeAgentInit
 # ---------------------------------------------------------------------------
@@ -483,3 +507,102 @@ class TestChatClaudeAgentSync:
             result = agent._generate([HumanMessage(content="Hi")])
 
         assert result.generations[0].message.content == "sync result"
+
+
+# ---------------------------------------------------------------------------
+# TestChatClaudeAgentStream
+# ---------------------------------------------------------------------------
+
+
+class TestChatClaudeAgentStream:
+    """Tests for _stream and _astream."""
+
+    @pytest.mark.asyncio
+    async def test_astream_yields_chunks(self):
+        """_astream should yield ChatGenerationChunk for each text delta."""
+        from langchain_claude_agent import ChatClaudeAgent
+
+        llm = ChatClaudeAgent()
+        messages = [HumanMessage(content="Tell me a story")]
+
+        async def mock_query(*args, **kwargs):
+            yield _make_stream_event("Once ")
+            yield _make_stream_event("upon ")
+            yield _make_stream_event("a time")
+            yield _make_result_message(
+                usage={"input_tokens": 10, "output_tokens": 6}
+            )
+
+        with patch("langchain_claude_agent.chat_model.sdk_query", mock_query):
+            chunks = []
+            async for chunk in llm._astream(messages):
+                chunks.append(chunk)
+
+        text_chunks = [c for c in chunks if c.message.content]
+        assert len(text_chunks) == 3
+        full_text = "".join(c.message.content for c in text_chunks)
+        assert full_text == "Once upon a time"
+
+    @pytest.mark.asyncio
+    async def test_astream_final_chunk_has_usage(self):
+        """The final chunk from _astream should carry usage metadata."""
+        from langchain_claude_agent import ChatClaudeAgent
+
+        llm = ChatClaudeAgent()
+        messages = [HumanMessage(content="hello")]
+
+        async def mock_query(*args, **kwargs):
+            yield _make_stream_event("hi")
+            yield _make_result_message(
+                usage={"input_tokens": 50, "output_tokens": 25}
+            )
+
+        with patch("langchain_claude_agent.chat_model.sdk_query", mock_query):
+            chunks = []
+            async for chunk in llm._astream(messages):
+                chunks.append(chunk)
+
+        # Last chunk should have usage metadata
+        last_chunk = chunks[-1]
+        assert last_chunk.message.usage_metadata["input_tokens"] == 50
+
+    @pytest.mark.asyncio
+    async def test_astream_calls_run_manager(self):
+        """_astream should call run_manager.on_llm_new_token for each delta."""
+        from langchain_claude_agent import ChatClaudeAgent
+
+        llm = ChatClaudeAgent()
+        messages = [HumanMessage(content="hello")]
+
+        async def mock_query(*args, **kwargs):
+            yield _make_stream_event("hi")
+            yield _make_result_message()
+
+        mock_manager = AsyncMock()
+
+        with patch("langchain_claude_agent.chat_model.sdk_query", mock_query):
+            async for _ in llm._astream(messages, run_manager=mock_manager):
+                pass
+
+        mock_manager.on_llm_new_token.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_astream_uses_include_partial_messages(self):
+        """_astream should set include_partial_messages=True in options."""
+        from langchain_claude_agent import ChatClaudeAgent
+
+        llm = ChatClaudeAgent()
+        messages = [HumanMessage(content="hello")]
+
+        captured_kwargs = {}
+
+        async def mock_query(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            yield _make_result_message()
+
+        with patch("langchain_claude_agent.chat_model.sdk_query", mock_query):
+            async for _ in llm._astream(messages):
+                pass
+
+        options = captured_kwargs.get("options")
+        assert options.include_partial_messages is True

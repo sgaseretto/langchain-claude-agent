@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Iterator, Optional
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, create_sdk_mcp_server
 from claude_agent_sdk import query as sdk_query
@@ -13,8 +13,8 @@ from langchain_core.callbacks import (
     CallbackManagerForLLMRun,
 )
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import Runnable
 
 from langchain_claude_agent._tool_converter import convert_langchain_tools
@@ -55,6 +55,18 @@ def _is_result_message(msg: Any) -> bool:
         True when *msg* carries both ``usage`` and ``subtype`` attributes.
     """
     return hasattr(msg, "usage") and hasattr(msg, "subtype")
+
+
+def _is_stream_event(msg: Any) -> bool:
+    """Check whether *msg* looks like an SDK StreamEvent.
+
+    Args:
+        msg: An object yielded by ``sdk_query``.
+
+    Returns:
+        True when *msg* has an ``event`` attribute that is a dict.
+    """
+    return hasattr(msg, "event") and isinstance(getattr(msg, "event", None), dict)
 
 
 class ChatClaudeAgent(BaseChatModel):
@@ -307,3 +319,85 @@ class ChatClaudeAgent(BaseChatModel):
             A ``ChatResult`` produced by the async generation path.
         """
         return asyncio.run(self._agenerate(messages, stop, **kwargs))
+
+    # --------------------------------------------------------------------- #
+    # Streaming
+    # --------------------------------------------------------------------- #
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        """Stream tokens asynchronously using SDK partial messages.
+
+        Args:
+            messages: LangChain messages.
+            stop: Stop sequences.
+            run_manager: Callback manager for on_llm_new_token.
+            **kwargs: Additional arguments.
+
+        Yields:
+            ChatGenerationChunk with AIMessageChunk for each text delta.
+        """
+        system_prompt, chat_messages = extract_system_message(messages)
+        prompt = convert_messages_to_prompt(chat_messages)
+        options = self._build_options(
+            system_prompt, include_partial_messages=True
+        )
+
+        async for message in sdk_query(prompt=prompt, options=options):
+            if _is_stream_event(message):
+                event = message.event
+                if event.get("type") == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        text = delta.get("text", "")
+                        chunk = ChatGenerationChunk(
+                            message=AIMessageChunk(content=text)
+                        )
+                        if run_manager:
+                            await run_manager.on_llm_new_token(
+                                text, chunk=chunk
+                            )
+                        yield chunk
+            elif _is_result_message(message):
+                usage = map_sdk_usage(message.usage)
+                if usage:
+                    yield ChatGenerationChunk(
+                        message=AIMessageChunk(
+                            content="", usage_metadata=usage
+                        )
+                    )
+
+    def _stream(
+        self,
+        messages: list[BaseMessage],
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        """Stream tokens synchronously by wrapping the async stream.
+
+        Args:
+            messages: LangChain messages.
+            stop: Stop sequences.
+            run_manager: Callback manager.
+            **kwargs: Additional arguments.
+
+        Yields:
+            ChatGenerationChunk for each text delta.
+        """
+        loop = asyncio.new_event_loop()
+        try:
+            aiter = self._astream(messages, stop, **kwargs)
+            while True:
+                try:
+                    chunk = loop.run_until_complete(aiter.__anext__())
+                    yield chunk
+                except StopAsyncIteration:
+                    break
+        finally:
+            loop.close()
