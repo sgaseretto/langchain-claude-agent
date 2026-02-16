@@ -1,0 +1,43 @@
+[project]
+name = "langchain-claude-agent"
+version = "0.1.0"
+description = "Use the Claude Agent SDK as an LLM provider in LangChain/LangGraph"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [
+    { name = "sgaseretto" }
+]
+dependencies = [
+    "langchain-core>=0.3.0",
+    "claude-agent-sdk",
+    "fastcore",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pytest",
+    "pytest-asyncio",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "I"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
