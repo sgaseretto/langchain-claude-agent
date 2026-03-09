@@ -12,6 +12,7 @@ dependencies = [
     "langchain-core>=0.3.0",
     "claude-agent-sdk",
     "pydantic>=2.0",
+    "nest-asyncio>=1.6.0",
 ]
 
 [project.optional-dependencies]
@@ -19,6 +20,8 @@ dev = [
     "ruff",
     "pytest",
     "pytest-asyncio",
+    "jupyter",
+    "ipykernel",
 ]
 
 [build-system]

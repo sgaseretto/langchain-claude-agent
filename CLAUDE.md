@@ -1,0 +1,21 @@
+- Make commits and pull requests with a clear and descriptive message that explains the purpose of the change. Always make them as if `sgaseretto` wrote them
+- Use uv as the main package manager for the project. Make sure to include a `uv.lock` file in the repository to ensure consistent dependencies across different environments.
+- Use google docstrings for documenting functions, classes, and modules. This will help maintain a consistent style and make it easier for others to understand the code.
+- Use fastcore as much as possible for this library 
+- Structure it in a way that it can be easily be turned into a package and published on PyPI or in the future. This includes organizing the code into modules, providing a clear entry point for users, and including necessary metadata files like `setup.py` or `pyproject.toml`.
+- Use `ruff` as the linter for the project to ensure code quality and consistency. Make sure to configure it properly to catch common issues and enforce coding standards. https://docs.astral.sh/ruff/llms.txt
+- If using types use `ty` for type checking https://docs.astral.sh/ty/llms.txt
+- For checking how claude-agent-sdk functionalities, you can go to these links:
+  - https://platform.claude.com/docs/en/agent-sdk/overview.md
+  - https://platform.claude.com/docs/en/agent-sdk/quickstart.md
+  - https://platform.claude.com/docs/en/agent-sdk/python.md
+  - https://platform.claude.com/docs/en/agent-sdk/streaming-vs-single-mode.md
+  - https://platform.claude.com/docs/en/agent-sdk/streaming-output.md
+  - https://platform.claude.com/docs/en/agent-sdk/stop-reasons.md
+  - https://platform.claude.com/docs/en/agent-sdk/structured-outputs.md
+  - https://platform.claude.com/docs/en/agent-sdk/hosting.md
+  - https://platform.claude.com/docs/en/agent-sdk/secure-deployment.md
+  - https://platform.claude.com/docs/en/agent-sdk/modifying-system-prompts.md
+  - https://platform.claude.com/docs/en/agent-sdk/mcp.md
+  - https://platform.claude.com/docs/en/agent-sdk/custom-tools.md
+  - https://platform.claude.com/docs/en/agent-sdk/cost-tracking.md
