@@ -10,6 +10,7 @@ import nest_asyncio
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     ResultMessage,
     ThinkingBlock,
     create_sdk_mcp_server,
@@ -25,7 +26,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.output_parsers import JsonOutputParser, PydanticOutputParser
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.runnables import Runnable, RunnablePassthrough
+from langchain_core.runnables import Runnable
 
 from langchain_claude_agent._tool_converter import convert_langchain_tools
 from langchain_claude_agent._types import (
@@ -40,7 +41,9 @@ from langchain_claude_agent._types import (
 )
 from langchain_claude_agent._utils import (
     convert_messages_to_prompt,
+    convert_messages_to_sdk_streaming,
     extract_system_message,
+    has_multimodal_content,
     map_sdk_usage,
 )
 
@@ -104,6 +107,23 @@ async def _streaming_prompt(text: str) -> AsyncIterator[dict]:
             "content": text,
         },
     }
+
+
+async def _streaming_messages(
+    sdk_messages: list[dict],
+) -> AsyncIterator[dict]:
+    """Yield pre-built SDK streaming message dicts as an async generator.
+
+    Used for multimodal messages that need the streaming input format.
+
+    Args:
+        sdk_messages: A list of SDK streaming message dicts.
+
+    Yields:
+        Each SDK message dict.
+    """
+    for msg in sdk_messages:
+        yield msg
 
 
 def _schema_to_output_format(schema: Any) -> OutputFormat:
@@ -186,6 +206,7 @@ class ChatClaudeAgSDK(BaseChatModel):
         *,
         include_partial_messages: bool = False,
         output_format: OutputFormat | None = None,
+        stderr_lines: list[str] | None = None,
     ) -> ClaudeAgentOptions:
         """Build a ``ClaudeAgentOptions`` from the agent's configuration.
 
@@ -196,10 +217,20 @@ class ChatClaudeAgSDK(BaseChatModel):
             include_partial_messages: Whether the SDK should yield partial
                 (streaming) messages.
             output_format: Optional structured output format dict.
+            stderr_lines: Optional list that will collect stderr output from
+                the CLI process for debugging purposes.
 
         Returns:
             A fully-populated ``ClaudeAgentOptions`` instance.
         """
+        stderr_callback = None
+        if stderr_lines is not None:
+
+            def _collect_stderr(line: str) -> None:
+                stderr_lines.append(line)
+
+            stderr_callback = _collect_stderr
+
         return ClaudeAgentOptions(
             model=self.model,
             system_prompt=system_prompt
@@ -214,6 +245,7 @@ class ChatClaudeAgSDK(BaseChatModel):
             thinking=self.thinking,
             effort=self.effort,
             output_format=output_format,
+            stderr=stderr_callback,
         )
 
     # --------------------------------------------------------------------- #
@@ -299,15 +331,46 @@ class ChatClaudeAgSDK(BaseChatModel):
             parser = JsonOutputParser()
 
         if include_raw:
-            return RunnablePassthrough.assign(
-                parsed=lambda x: x,
-                parsing_error=lambda x: None,
-            ) | {
-                "raw": llm,
-                "parsed": llm | parser,
-                "parsing_error": lambda x: None,
-            }
+
+            def _parse_with_raw(input: Any) -> dict:
+                """Invoke the LLM, parse, and return raw + parsed + error."""
+                raw = llm.invoke(input)
+                try:
+                    parsed = parser.invoke(raw)
+                    return {"raw": raw, "parsed": parsed, "parsing_error": None}
+                except Exception as e:
+                    return {"raw": raw, "parsed": None, "parsing_error": e}
+
+            from langchain_core.runnables import RunnableLambda
+
+            return RunnableLambda(_parse_with_raw)
         return llm | parser
+
+    # --------------------------------------------------------------------- #
+    # ClaudeSDKClient helper (for multimodal / images)
+    # --------------------------------------------------------------------- #
+
+    async def _client_messages(
+        self,
+        options: ClaudeAgentOptions,
+        prompt: Any,
+    ) -> AsyncIterator:
+        """Run a query via ``ClaudeSDKClient`` and yield SDK messages.
+
+        ``ClaudeSDKClient`` keeps the transport connection open, which is
+        required for multimodal (image) content.
+
+        Args:
+            options: Fully-built ``ClaudeAgentOptions``.
+            prompt: An async iterable of SDK streaming message dicts.
+
+        Yields:
+            SDK message objects (``AssistantMessage``, ``ResultMessage``, etc.).
+        """
+        async with ClaudeSDKClient(options) as client:
+            await client.query(prompt)
+            async for message in client.receive_response():
+                yield message
 
     # --------------------------------------------------------------------- #
     # Async generation
@@ -335,39 +398,82 @@ class ChatClaudeAgSDK(BaseChatModel):
         tools = kwargs.pop("tools", None)
         output_format = kwargs.pop("output_format", None)
         system_prompt, chat_messages = extract_system_message(messages)
-        prompt_text = convert_messages_to_prompt(chat_messages)
-        options = self._build_options(system_prompt, output_format=output_format)
 
-        has_mcp = False
+        stderr_lines: list[str] = []
+        options = self._build_options(
+            system_prompt, output_format=output_format, stderr_lines=stderr_lines
+        )
+
+        use_streaming = False
         if tools:
             self._attach_tools_to_options(options, tools)
-            has_mcp = True
+            use_streaming = True
 
-        # MCP tools require streaming input (async generator), not a plain string
-        prompt: Any = _streaming_prompt(prompt_text) if has_mcp else prompt_text
+        multimodal = has_multimodal_content(chat_messages)
+        if multimodal:
+            use_streaming = True
+
+        # Build prompt: streaming mode for MCP tools or multimodal content
+        if use_streaming and multimodal:
+            sdk_msgs = convert_messages_to_sdk_streaming(chat_messages)
+            prompt: Any = _streaming_messages(sdk_msgs)
+        elif use_streaming:
+            prompt_text = convert_messages_to_prompt(chat_messages)
+            prompt = _streaming_prompt(prompt_text)
+        else:
+            prompt = convert_messages_to_prompt(chat_messages)
 
         result_text = ""
         thinking_blocks: list[dict] = []
         usage_data: dict = {}
         structured_output = None
 
-        async for message in sdk_query(prompt=prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, ThinkingBlock):
-                        thinking_blocks.append(
-                            {
-                                "type": "thinking",
-                                "thinking": block.thinking,
-                                "signature": block.signature,
-                            }
-                        )
-                    elif hasattr(block, "text"):
-                        result_text += block.text
-            elif isinstance(message, ResultMessage):
-                usage_data = message.usage or {}
-                if message.structured_output is not None:
-                    structured_output = message.structured_output
+        try:
+            # Use ClaudeSDKClient for multimodal (images require persistent
+            # connection), query() for everything else.
+            if multimodal:
+                async with ClaudeSDKClient(options) as client:
+                    await client.query(prompt)
+                    async for message in client.receive_response():
+                        if isinstance(message, AssistantMessage):
+                            for block in message.content:
+                                if isinstance(block, ThinkingBlock):
+                                    thinking_blocks.append(
+                                        {
+                                            "type": "thinking",
+                                            "thinking": block.thinking,
+                                            "signature": block.signature,
+                                        }
+                                    )
+                                elif hasattr(block, "text"):
+                                    result_text += block.text
+                        elif isinstance(message, ResultMessage):
+                            usage_data = message.usage or {}
+                            if message.structured_output is not None:
+                                structured_output = message.structured_output
+            else:
+                async for message in sdk_query(prompt=prompt, options=options):
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, ThinkingBlock):
+                                thinking_blocks.append(
+                                    {
+                                        "type": "thinking",
+                                        "thinking": block.thinking,
+                                        "signature": block.signature,
+                                    }
+                                )
+                            elif hasattr(block, "text"):
+                                result_text += block.text
+                    elif isinstance(message, ResultMessage):
+                        usage_data = message.usage or {}
+                        if message.structured_output is not None:
+                            structured_output = message.structured_output
+        except Exception as e:
+            if stderr_lines:
+                stderr_detail = "\n".join(stderr_lines)
+                raise type(e)(f"{e}\nCLI stderr:\n{stderr_detail}") from e
+            raise
 
         # Use structured output as content if available
         content = (
@@ -441,22 +547,42 @@ class ChatClaudeAgSDK(BaseChatModel):
         tools = kwargs.pop("tools", None)
         output_format = kwargs.pop("output_format", None)
         system_prompt, chat_messages = extract_system_message(messages)
-        prompt_text = convert_messages_to_prompt(chat_messages)
+
+        stderr_lines: list[str] = []
         options = self._build_options(
             system_prompt,
             include_partial_messages=True,
             output_format=output_format,
+            stderr_lines=stderr_lines,
         )
 
-        has_mcp = False
+        use_streaming = False
         if tools:
             self._attach_tools_to_options(options, tools)
-            has_mcp = True
+            use_streaming = True
 
-        # MCP tools require streaming input (async generator), not a plain string
-        prompt: Any = _streaming_prompt(prompt_text) if has_mcp else prompt_text
+        multimodal = has_multimodal_content(chat_messages)
+        if multimodal:
+            use_streaming = True
 
-        async for message in sdk_query(prompt=prompt, options=options):
+        # Build prompt: streaming mode for MCP tools or multimodal content
+        if use_streaming and multimodal:
+            sdk_msgs = convert_messages_to_sdk_streaming(chat_messages)
+            prompt: Any = _streaming_messages(sdk_msgs)
+        elif use_streaming:
+            prompt_text = convert_messages_to_prompt(chat_messages)
+            prompt = _streaming_prompt(prompt_text)
+        else:
+            prompt = convert_messages_to_prompt(chat_messages)
+
+        # Choose message source: ClaudeSDKClient for multimodal (images
+        # require persistent connection), query() for everything else.
+        if multimodal:
+            msg_source = self._client_messages(options, prompt)
+        else:
+            msg_source = sdk_query(prompt=prompt, options=options)
+
+        async for message in msg_source:
             if isinstance(message, StreamEvent):
                 event = message.event
                 if event.get("type") == "content_block_delta":
@@ -470,7 +596,6 @@ class ChatClaudeAgSDK(BaseChatModel):
                             await run_manager.on_llm_new_token(text, chunk=chunk)
                         yield chunk
             elif isinstance(message, AssistantMessage):
-                # Fallback when SDK returns complete messages (e.g. with thinking)
                 thinking_blocks: list[dict] = []
                 for block in message.content:
                     if isinstance(block, ThinkingBlock):

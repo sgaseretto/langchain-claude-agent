@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+from typing import Any
 
 from langchain_core.messages import (
     AIMessage,
@@ -73,6 +75,156 @@ def convert_messages_to_prompt(messages: list[BaseMessage]) -> str:
             lines.append(f"{msg.type}: {msg.content}")
 
     return "\n".join(lines)
+
+
+def has_multimodal_content(messages: list[BaseMessage]) -> bool:
+    """Check if any message contains multimodal content (images).
+
+    Args:
+        messages: A list of LangChain BaseMessage instances.
+
+    Returns:
+        True if any message has list-based content with image blocks.
+    """
+    for msg in messages:
+        if isinstance(msg.content, list):
+            for block in msg.content:
+                if isinstance(block, dict) and block.get("type") in (
+                    "image_url",
+                    "image",
+                ):
+                    return True
+    return False
+
+
+def _convert_image_block(block: dict[str, Any]) -> dict[str, Any]:
+    """Convert a LangChain image_url block to SDK image format.
+
+    Handles both data URIs (``data:image/jpeg;base64,...``) and plain
+    base64 strings.
+
+    Args:
+        block: A LangChain image_url content block.
+
+    Returns:
+        An SDK-formatted image block with ``type``, ``source`` keys.
+    """
+    url = block.get("image_url", {}).get("url", "")
+
+    # Parse data URI: data:image/jpeg;base64,<data>
+    match = re.match(r"data:(image/\w+);base64,(.+)", url)
+    if match:
+        media_type = match.group(1)
+        data = match.group(2)
+    else:
+        # Assume raw base64 JPEG if no data URI prefix
+        media_type = "image/jpeg"
+        data = url
+
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": data,
+        },
+    }
+
+
+def _convert_message_content(content: Any) -> Any:
+    """Convert LangChain message content to SDK streaming message format.
+
+    Handles both plain strings and multimodal content lists.
+
+    Args:
+        content: Message content — either a string or a list of content blocks.
+
+    Returns:
+        A string or a list of SDK-formatted content blocks.
+    """
+    if isinstance(content, str):
+        return content
+
+    sdk_blocks = []
+    for block in content:
+        if not isinstance(block, dict):
+            sdk_blocks.append({"type": "text", "text": str(block)})
+        elif block.get("type") == "text":
+            sdk_blocks.append({"type": "text", "text": block.get("text", "")})
+        elif block.get("type") == "image_url":
+            sdk_blocks.append(_convert_image_block(block))
+        elif block.get("type") == "image":
+            # Already in SDK format
+            sdk_blocks.append(block)
+        else:
+            sdk_blocks.append({"type": "text", "text": str(block)})
+    return sdk_blocks
+
+
+def convert_messages_to_sdk_streaming(
+    messages: list[BaseMessage],
+) -> list[dict[str, Any]]:
+    """Convert LangChain messages to SDK streaming input message dicts.
+
+    Each message is converted to the SDK's streaming format:
+    ``{"type": "user", "message": {"role": "user", "content": ...}}``.
+    Supports multimodal content (images).
+
+    Args:
+        messages: A list of LangChain BaseMessage instances (system messages
+            should already be extracted).
+
+    Returns:
+        A list of SDK streaming message dicts.
+    """
+    sdk_messages = []
+    for msg in messages:
+        if isinstance(msg, SystemMessage):
+            continue
+        elif isinstance(msg, HumanMessage):
+            sdk_messages.append(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": _convert_message_content(msg.content),
+                    },
+                }
+            )
+        elif isinstance(msg, AIMessage):
+            sdk_messages.append(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "assistant",
+                        "content": _convert_message_content(msg.content),
+                    },
+                }
+            )
+        elif isinstance(msg, ToolMessage):
+            name = getattr(msg, "name", None)
+            text = (
+                f"Tool Result ({name}): {msg.content}"
+                if name
+                else f"Tool Result: {msg.content}"
+            )
+            sdk_messages.append(
+                {
+                    "type": "user",
+                    "message": {"role": "user", "content": text},
+                }
+            )
+        else:
+            sdk_messages.append(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": _convert_message_content(msg.content),
+                    },
+                }
+            )
+    return sdk_messages
 
 
 def map_sdk_usage(sdk_usage: dict | None) -> dict:
