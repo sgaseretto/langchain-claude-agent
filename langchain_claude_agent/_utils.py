@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import re
 from typing import Any
@@ -64,13 +66,24 @@ def convert_messages_to_prompt(messages: list[BaseMessage]) -> str:
         elif isinstance(msg, HumanMessage):
             lines.append(f"Human: {msg.content}")
         elif isinstance(msg, AIMessage):
-            lines.append(f"Assistant: {msg.content}")
+            if msg.content:
+                lines.append(f"Assistant: {msg.content}")
+            for tool_call in msg.tool_calls:
+                tool_name = tool_call.get("name", "tool")
+                tool_call_id = tool_call.get("id")
+                args = json.dumps(tool_call.get("args", {}), sort_keys=True)
+                prefix = f"Assistant Tool Call ({tool_name})"
+                if tool_call_id:
+                    prefix += f" [{tool_call_id}]"
+                lines.append(f"{prefix}: {args}")
         elif isinstance(msg, ToolMessage):
             name = getattr(msg, "name", None)
-            if name:
-                lines.append(f"Tool Result ({name}): {msg.content}")
-            else:
-                lines.append(f"Tool Result: {msg.content}")
+            prefix = f"Tool Result ({name})" if name else "Tool Result"
+            if msg.tool_call_id:
+                prefix += f" [{msg.tool_call_id}]"
+            if msg.status == "error":
+                prefix += " [error]"
+            lines.append(f"{prefix}: {msg.content}")
         else:
             lines.append(f"{msg.type}: {msg.content}")
 
@@ -98,26 +111,49 @@ def has_multimodal_content(messages: list[BaseMessage]) -> bool:
 
 
 def _convert_image_block(block: dict[str, Any]) -> dict[str, Any]:
-    """Convert a LangChain image_url block to SDK image format.
+    """Convert a multimodal image block to the SDK query() format.
 
-    Handles both data URIs (``data:image/jpeg;base64,...``) and plain
-    base64 strings.
+    Supports LangChain ``image_url`` blocks, SDK-style ``image`` blocks,
+    and base64 ``image`` blocks using ``mime_type``/``data`` fields.
 
     Args:
-        block: A LangChain image_url content block.
+        block: A multimodal image content block.
 
     Returns:
-        An SDK-formatted image block with ``type``, ``source`` keys.
+        An SDK-formatted image block with ``type`` and ``source`` keys.
     """
-    url = block.get("image_url", {}).get("url", "")
+    if block.get("type") == "image":
+        source = block.get("source")
+        if isinstance(source, dict):
+            return {
+                "type": "image",
+                "source": {
+                    "type": source.get("type", "base64"),
+                    "media_type": source.get("media_type", "image/jpeg"),
+                    "data": source.get("data", ""),
+                },
+            }
 
-    # Parse data URI: data:image/jpeg;base64,<data>
-    match = re.match(r"data:(image/\w+);base64,(.+)", url)
+        if block.get("source_type") == "base64":
+            return {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": block.get("mime_type", "image/jpeg"),
+                    "data": block.get("data", ""),
+                },
+            }
+
+        return block
+
+    image_url = block.get("image_url", "")
+    url = image_url.get("url", "") if isinstance(image_url, dict) else image_url
+
+    match = re.match(r"data:(image/[^;]+);base64,(.+)", url)
     if match:
         media_type = match.group(1)
         data = match.group(2)
     else:
-        # Assume raw base64 JPEG if no data URI prefix
         media_type = "image/jpeg"
         data = url
 
@@ -151,11 +187,8 @@ def _convert_message_content(content: Any) -> Any:
             sdk_blocks.append({"type": "text", "text": str(block)})
         elif block.get("type") == "text":
             sdk_blocks.append({"type": "text", "text": block.get("text", "")})
-        elif block.get("type") == "image_url":
+        elif block.get("type") in ("image_url", "image"):
             sdk_blocks.append(_convert_image_block(block))
-        elif block.get("type") == "image":
-            # Already in SDK format
-            sdk_blocks.append(block)
         else:
             sdk_blocks.append({"type": "text", "text": str(block)})
     return sdk_blocks
@@ -196,22 +229,19 @@ def convert_messages_to_sdk_streaming(
                 {
                     "type": "user",
                     "message": {
-                        "role": "assistant",
-                        "content": _convert_message_content(msg.content),
+                        "role": "user",
+                        "content": convert_messages_to_prompt([msg]),
                     },
                 }
             )
         elif isinstance(msg, ToolMessage):
-            name = getattr(msg, "name", None)
-            text = (
-                f"Tool Result ({name}): {msg.content}"
-                if name
-                else f"Tool Result: {msg.content}"
-            )
             sdk_messages.append(
                 {
                     "type": "user",
-                    "message": {"role": "user", "content": text},
+                    "message": {
+                        "role": "user",
+                        "content": convert_messages_to_prompt([msg]),
+                    },
                 }
             )
         else:
@@ -267,6 +297,26 @@ def map_sdk_usage(sdk_usage: dict | None) -> dict:
     return result
 
 
+def _run_coroutine_sync(coro: Any) -> Any:
+    """Run a coroutine from sync code, including notebook event loops.
+
+    Args:
+        coro: Awaitable coroutine to execute.
+
+    Returns:
+        The coroutine result.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    import nest_asyncio
+
+    nest_asyncio.apply(loop)
+    return loop.run_until_complete(coro)
+
+
 def check_claude_agent_sdk_credentials() -> tuple[bool, str]:
     """Check if Claude Agent SDK credentials are available.
 
@@ -294,8 +344,6 @@ def check_claude_agent_sdk_credentials() -> tuple[bool, str]:
 
     # Probe SDK directly
     try:
-        import asyncio
-
         from claude_agent_sdk import ClaudeAgentOptions
         from claude_agent_sdk import query as sdk_query
 
@@ -313,11 +361,7 @@ def check_claude_agent_sdk_credentials() -> tuple[bool, str]:
                 return True, f"claude_agent_sdk: probe completed with: {e}"
             return True, "claude_agent_sdk: probe completed successfully"
 
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(_probe())
-        finally:
-            loop.close()
+        return _run_coroutine_sync(_probe())
     except ImportError:
         return False, "claude_agent_sdk: not installed"
     except Exception as e:

@@ -10,20 +10,19 @@ import nest_asyncio
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
-    ClaudeSDKClient,
     ResultMessage,
     ThinkingBlock,
     create_sdk_mcp_server,
 )
 from claude_agent_sdk import query as sdk_query
 from claude_agent_sdk import tool as sdk_tool_decorator
-from claude_agent_sdk.types import StreamEvent
+from claude_agent_sdk.types import HookMatcher, StreamEvent, ToolUseBlock, UserMessage
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
     CallbackManagerForLLMRun,
 )
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
 from langchain_core.output_parsers import JsonOutputParser, PydanticOutputParser
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import Runnable
@@ -124,6 +123,233 @@ async def _streaming_messages(
     """
     for msg in sdk_messages:
         yield msg
+
+
+async def _delegate_langchain_tool_execution(
+    input_data: dict[str, Any],
+    tool_use_id: str | None,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    """Block SDK MCP execution so LangChain can handle the tool call itself.
+
+    Args:
+        input_data: Hook payload describing the attempted tool invocation.
+        tool_use_id: Tool use identifier from the SDK.
+        context: Hook execution context.
+
+    Returns:
+        Hook output instructing Claude Code not to run the tool locally.
+    """
+    del input_data, tool_use_id, context
+    return {
+        "continue_": False,
+        "decision": "block",
+        "reason": "Tool execution is delegated to the outer LangChain runtime.",
+    }
+
+
+def _coerce_array_tool_arg(value: Any) -> list[Any]:
+    """Coerce a model-produced value into a JSON-schema array.
+
+    This is only used for LangChain's synthetic structured-output tools,
+    where the model may emit a string for a field declared as ``list[str]``.
+
+    Args:
+        value: Raw tool argument value from the model.
+
+    Returns:
+        A best-effort list representation.
+    """
+    if isinstance(value, list):
+        return value
+
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        lowered = stripped.lower()
+        if lowered in {"[]", "none", "n/a"}:
+            return []
+        if "no" in lowered and "alert" in lowered:
+            return []
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                return parsed
+        separator = ";" if ";" in stripped else ","
+        parts = [part.strip() for part in stripped.split(separator)]
+        return [part for part in parts if part]
+
+    return [value]
+
+
+def _coerce_args_to_json_schema(
+    args: dict[str, Any],
+    json_schema: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Coerce tool arguments to match a JSON schema more closely.
+
+    Args:
+        args: Raw tool arguments from the model.
+        json_schema: JSON schema for the target tool, if available.
+
+    Returns:
+        Tool arguments after lightweight coercion.
+    """
+    if not json_schema:
+        return args
+
+    properties = json_schema.get("properties", {})
+    coerced = dict(args)
+    for key, value in args.items():
+        field_schema = properties.get(key, {})
+        if field_schema.get("type") == "array":
+            coerced[key] = _coerce_array_tool_arg(value)
+    return coerced
+
+
+def _build_tool_schema_map(tools: list[Any]) -> dict[str, dict[str, Any]]:
+    """Build a lookup of prefixed tool names to JSON schemas.
+
+    Args:
+        tools: Active bound tools for the current turn.
+
+    Returns:
+        Mapping of SDK-visible tool names to JSON schema dicts.
+    """
+    schema_map: dict[str, dict[str, Any]] = {}
+    for tool in tools:
+        args_schema = getattr(tool, "args_schema", None)
+        if not isinstance(args_schema, dict):
+            continue
+        prefixed_name = (
+            tool.name
+            if tool.name.startswith(TOOL_NAME_PREFIX)
+            else f"{TOOL_NAME_PREFIX}{tool.name}"
+        )
+        schema_map[prefixed_name] = args_schema
+    return schema_map
+
+
+def _langchain_tool_call_from_sdk_block(
+    block: ToolUseBlock,
+    json_schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Convert an SDK ToolUseBlock to a LangChain tool call.
+
+    Args:
+        block: The SDK tool-use block emitted by Claude Code.
+        json_schema: Optional JSON schema for the target tool.
+
+    Returns:
+        A LangChain-compatible tool call dictionary.
+    """
+    name = block.name
+    if name.startswith(TOOL_NAME_PREFIX):
+        name = name[len(TOOL_NAME_PREFIX) :]
+
+    return {
+        "name": name,
+        "args": _coerce_args_to_json_schema(block.input, json_schema),
+        "id": block.id,
+        "type": "tool_call",
+    }
+
+
+def _select_bound_tool_names(
+    tool_names: list[str],
+    tool_choice: str | dict[str, Any] | None,
+) -> list[str]:
+    """Resolve LangChain tool_choice values to SDK-allowed tool names.
+
+    Args:
+        tool_names: Prefixed SDK tool names.
+        tool_choice: LangChain tool-choice value.
+
+    Returns:
+        The subset of tool names that should remain available to Claude.
+
+    Raises:
+        ValueError: If the requested tool choice references an unknown tool.
+    """
+    if tool_choice in (None, "auto", "any", "required"):
+        return tool_names
+
+    if tool_choice == "none":
+        return []
+
+    chosen_name: str | None = None
+    if isinstance(tool_choice, str):
+        chosen_name = tool_choice
+    elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        chosen_name = tool_choice.get("function", {}).get("name")
+
+    if not chosen_name:
+        raise ValueError(f"Unsupported tool_choice: {tool_choice!r}")
+
+    prefixed_name = (
+        chosen_name
+        if chosen_name.startswith(TOOL_NAME_PREFIX)
+        else f"{TOOL_NAME_PREFIX}{chosen_name}"
+    )
+    if prefixed_name not in tool_names:
+        raise ValueError(f"Unknown tool_choice: {chosen_name}")
+
+    return [prefixed_name]
+
+
+def _is_langchain_response_format_tool(tool: Any) -> bool:
+    """Return True for LangChain ToolStrategy's synthetic schema tool.
+
+    LangChain currently represents the structured-output tool injected by
+    ``create_agent(..., response_format=ToolStrategy(...))`` as a tool whose
+    ``args_schema`` is already a JSON schema dictionary.
+
+    Args:
+        tool: Tool-like object supplied via ``bind_tools()``.
+
+    Returns:
+        True when the tool looks like LangChain's synthetic structured-output
+        tool, False otherwise.
+    """
+    args_schema = getattr(tool, "args_schema", None)
+    return isinstance(args_schema, dict) and isinstance(
+        args_schema.get("properties"), dict
+    )
+
+
+def _select_tools_for_turn(
+    tools: list[Any],
+    messages: list[BaseMessage] | None = None,
+) -> list[Any]:
+    """Select the bound tools that should be visible for the current turn.
+
+    For LangChain ``ToolStrategy`` flows, the synthetic schema tool should only
+    be exposed after tool results are already present in the conversation. This
+    keeps the SDK from eagerly emitting the schema tool call before real tool
+    outputs have been returned to the outer LangChain loop.
+
+    Args:
+        tools: The full list of bound LangChain tools.
+        messages: Conversation messages for the current turn.
+
+    Returns:
+        The subset of tools that should be exposed to the SDK on this turn.
+    """
+    structured_tools = [tool for tool in tools if _is_langchain_response_format_tool(tool)]
+    if not structured_tools:
+        return tools
+
+    regular_tools = [tool for tool in tools if not _is_langchain_response_format_tool(tool)]
+    has_tool_results = any(isinstance(message, ToolMessage) for message in messages or [])
+
+    if has_tool_results:
+        return structured_tools if regular_tools else tools
+
+    return regular_tools or tools
 
 
 def _schema_to_output_format(schema: Any) -> OutputFormat:
@@ -256,31 +482,41 @@ class ChatClaudeAgSDK(BaseChatModel):
         self,
         tools: list,
         *,
-        tool_choice: str | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> Runnable:
-        """Bind LangChain tools for autonomous SDK execution.
+        """Bind LangChain tools for provider-style tool calling.
 
         Args:
             tools: List of LangChain tool instances.
-            tool_choice: Not used (SDK handles tool selection autonomously).
+            tool_choice: Optional LangChain tool-choice hint.
             **kwargs: Additional arguments passed to bind().
 
         Returns:
             A Runnable with tools stored in kwargs.
         """
-        return self.bind(tools=tools, **kwargs)
+        return self.bind(tools=tools, tool_choice=tool_choice, **kwargs)
 
     def _attach_tools_to_options(
-        self, options: ClaudeAgentOptions, tools: list
-    ) -> None:
+        self,
+        options: ClaudeAgentOptions,
+        tools: list,
+        tool_choice: str | dict[str, Any] | None = None,
+        messages: list[BaseMessage] | None = None,
+    ) -> list[str]:
         """Convert LangChain tools to an MCP server and attach to *options*.
 
         Args:
             options: The ``ClaudeAgentOptions`` to mutate in-place.
             tools: LangChain tool instances to convert and bind.
+            tool_choice: Optional LangChain tool-choice hint.
+            messages: Conversation messages for the current turn.
+
+        Returns:
+            The prefixed tool names exposed to Claude for this invocation.
         """
-        sdk_tool_specs = convert_langchain_tools(tools)
+        active_tools = _select_tools_for_turn(tools, messages)
+        sdk_tool_specs = convert_langchain_tools(active_tools)
 
         sdk_tools = []
         for spec in sdk_tool_specs:
@@ -295,9 +531,24 @@ class ChatClaudeAgSDK(BaseChatModel):
             tools=sdk_tools,
         )
         tool_names = [f"{TOOL_NAME_PREFIX}{spec.name}" for spec in sdk_tool_specs]
+        selected_tool_names = _select_bound_tool_names(tool_names, tool_choice)
+
+        if not selected_tool_names:
+            options.allowed_tools = self.allowed_tools or []
+            return []
 
         options.mcp_servers = {MCP_SERVER_NAME: mcp_server}
-        options.allowed_tools = tool_names + (self.allowed_tools or [])
+        options.allowed_tools = selected_tool_names + (self.allowed_tools or [])
+        options.hooks = {
+            "PreToolUse": [
+                HookMatcher(
+                    matcher=tool_name,
+                    hooks=[_delegate_langchain_tool_execution],
+                )
+                for tool_name in selected_tool_names
+            ]
+        }
+        return selected_tool_names
 
     # --------------------------------------------------------------------- #
     # Structured output
@@ -347,32 +598,6 @@ class ChatClaudeAgSDK(BaseChatModel):
         return llm | parser
 
     # --------------------------------------------------------------------- #
-    # ClaudeSDKClient helper (for multimodal / images)
-    # --------------------------------------------------------------------- #
-
-    async def _client_messages(
-        self,
-        options: ClaudeAgentOptions,
-        prompt: Any,
-    ) -> AsyncIterator:
-        """Run a query via ``ClaudeSDKClient`` and yield SDK messages.
-
-        ``ClaudeSDKClient`` keeps the transport connection open, which is
-        required for multimodal (image) content.
-
-        Args:
-            options: Fully-built ``ClaudeAgentOptions``.
-            prompt: An async iterable of SDK streaming message dicts.
-
-        Yields:
-            SDK message objects (``AssistantMessage``, ``ResultMessage``, etc.).
-        """
-        async with ClaudeSDKClient(options) as client:
-            await client.query(prompt)
-            async for message in client.receive_response():
-                yield message
-
-    # --------------------------------------------------------------------- #
     # Async generation
     # --------------------------------------------------------------------- #
 
@@ -396,6 +621,7 @@ class ChatClaudeAgSDK(BaseChatModel):
             ``AIMessage``.
         """
         tools = kwargs.pop("tools", None)
+        tool_choice = kwargs.pop("tool_choice", None)
         output_format = kwargs.pop("output_format", None)
         system_prompt, chat_messages = extract_system_message(messages)
 
@@ -405,16 +631,23 @@ class ChatClaudeAgSDK(BaseChatModel):
         )
 
         use_streaming = False
+        selected_bound_tool_names: set[str] = set()
+        tool_schema_map: dict[str, dict[str, Any]] = {}
         if tools:
-            self._attach_tools_to_options(options, tools)
+            tool_schema_map = _build_tool_schema_map(
+                _select_tools_for_turn(tools, chat_messages)
+            )
+            selected_bound_tool_names = set(
+                self._attach_tools_to_options(options, tools, tool_choice, chat_messages)
+            )
             use_streaming = True
 
         multimodal = has_multimodal_content(chat_messages)
         if multimodal:
             use_streaming = True
 
-        # Build prompt: streaming mode for MCP tools or multimodal content
-        if use_streaming and multimodal:
+        # Build prompt: streaming mode for MCP tools or multimodal content.
+        if multimodal:
             sdk_msgs = convert_messages_to_sdk_streaming(chat_messages)
             prompt: Any = _streaming_messages(sdk_msgs)
         elif use_streaming:
@@ -425,60 +658,60 @@ class ChatClaudeAgSDK(BaseChatModel):
 
         result_text = ""
         thinking_blocks: list[dict] = []
+        tool_calls: list[dict[str, Any]] = []
+        ignore_assistant_text = False
         usage_data: dict = {}
         structured_output = None
 
         try:
-            # Use ClaudeSDKClient for multimodal (images require persistent
-            # connection), query() for everything else.
-            if multimodal:
-                async with ClaudeSDKClient(options) as client:
-                    await client.query(prompt)
-                    async for message in client.receive_response():
-                        if isinstance(message, AssistantMessage):
-                            for block in message.content:
-                                if isinstance(block, ThinkingBlock):
-                                    thinking_blocks.append(
-                                        {
-                                            "type": "thinking",
-                                            "thinking": block.thinking,
-                                            "signature": block.signature,
-                                        }
-                                    )
-                                elif hasattr(block, "text"):
-                                    result_text += block.text
-                        elif isinstance(message, ResultMessage):
-                            usage_data = message.usage or {}
-                            if message.structured_output is not None:
-                                structured_output = message.structured_output
-            else:
-                async for message in sdk_query(prompt=prompt, options=options):
-                    if isinstance(message, AssistantMessage):
-                        for block in message.content:
-                            if isinstance(block, ThinkingBlock):
-                                thinking_blocks.append(
-                                    {
-                                        "type": "thinking",
-                                        "thinking": block.thinking,
-                                        "signature": block.signature,
-                                    }
+            async for message in sdk_query(prompt=prompt, options=options):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, ThinkingBlock):
+                            thinking_blocks.append(
+                                {
+                                    "type": "thinking",
+                                    "thinking": block.thinking,
+                                    "signature": block.signature,
+                                }
+                            )
+                        elif (
+                            isinstance(block, ToolUseBlock)
+                            and block.name in selected_bound_tool_names
+                        ):
+                            tool_calls.append(
+                                _langchain_tool_call_from_sdk_block(
+                                    block,
+                                    tool_schema_map.get(block.name),
                                 )
-                            elif hasattr(block, "text"):
+                            )
+                            ignore_assistant_text = True
+                        elif (
+                            isinstance(block, ToolUseBlock)
+                            and output_format is not None
+                            and block.name == "StructuredOutput"
+                        ):
+                            structured_output = block.input
+                            ignore_assistant_text = True
+                        elif hasattr(block, "text"):
+                            if not ignore_assistant_text:
                                 result_text += block.text
-                    elif isinstance(message, ResultMessage):
-                        usage_data = message.usage or {}
-                        if message.structured_output is not None:
-                            structured_output = message.structured_output
+                elif isinstance(message, UserMessage) and tool_calls:
+                    ignore_assistant_text = True
+                elif isinstance(message, ResultMessage):
+                    usage_data = message.usage or {}
+                    if message.structured_output is not None and not tool_calls:
+                        structured_output = message.structured_output
         except Exception as e:
             if stderr_lines:
                 stderr_detail = "\n".join(stderr_lines)
                 raise type(e)(f"{e}\nCLI stderr:\n{stderr_detail}") from e
             raise
 
-        # Use structured output as content if available
+        # Use structured output as content if available.
         content = (
             json.dumps(structured_output)
-            if structured_output is not None
+            if structured_output is not None and not tool_calls
             else result_text
         )
 
@@ -488,6 +721,7 @@ class ChatClaudeAgSDK(BaseChatModel):
 
         ai_msg = AIMessage(
             content=content,
+            tool_calls=tool_calls,
             usage_metadata=map_sdk_usage(usage_data),
             response_metadata={"model": self.model},
             additional_kwargs=additional_kwargs,
@@ -545,6 +779,7 @@ class ChatClaudeAgSDK(BaseChatModel):
             ChatGenerationChunk with AIMessageChunk for each text delta.
         """
         tools = kwargs.pop("tools", None)
+        tool_choice = kwargs.pop("tool_choice", None)
         output_format = kwargs.pop("output_format", None)
         system_prompt, chat_messages = extract_system_message(messages)
 
@@ -557,16 +792,23 @@ class ChatClaudeAgSDK(BaseChatModel):
         )
 
         use_streaming = False
+        selected_bound_tool_names: set[str] = set()
+        tool_schema_map: dict[str, dict[str, Any]] = {}
         if tools:
-            self._attach_tools_to_options(options, tools)
+            tool_schema_map = _build_tool_schema_map(
+                _select_tools_for_turn(tools, chat_messages)
+            )
+            selected_bound_tool_names = set(
+                self._attach_tools_to_options(options, tools, tool_choice, chat_messages)
+            )
             use_streaming = True
 
         multimodal = has_multimodal_content(chat_messages)
         if multimodal:
             use_streaming = True
 
-        # Build prompt: streaming mode for MCP tools or multimodal content
-        if use_streaming and multimodal:
+        # Build prompt: streaming mode for MCP tools or multimodal content.
+        if multimodal:
             sdk_msgs = convert_messages_to_sdk_streaming(chat_messages)
             prompt: Any = _streaming_messages(sdk_msgs)
         elif use_streaming:
@@ -575,15 +817,13 @@ class ChatClaudeAgSDK(BaseChatModel):
         else:
             prompt = convert_messages_to_prompt(chat_messages)
 
-        # Choose message source: ClaudeSDKClient for multimodal (images
-        # require persistent connection), query() for everything else.
-        if multimodal:
-            msg_source = self._client_messages(options, prompt)
-        else:
-            msg_source = sdk_query(prompt=prompt, options=options)
+        msg_source = sdk_query(prompt=prompt, options=options)
+        ignore_assistant_text = False
 
         async for message in msg_source:
             if isinstance(message, StreamEvent):
+                if ignore_assistant_text:
+                    continue
                 event = message.event
                 if event.get("type") == "content_block_delta":
                     delta = event.get("delta", {})
@@ -606,7 +846,42 @@ class ChatClaudeAgSDK(BaseChatModel):
                                 "signature": block.signature,
                             }
                         )
+                    elif (
+                        isinstance(block, ToolUseBlock)
+                        and block.name in selected_bound_tool_names
+                    ):
+                        ignore_assistant_text = True
+                        tool_call = _langchain_tool_call_from_sdk_block(
+                            block,
+                            tool_schema_map.get(block.name),
+                        )
+                        chunk = ChatGenerationChunk(
+                            message=AIMessageChunk(
+                                content="",
+                                tool_call_chunks=[
+                                    {
+                                        "name": tool_call["name"],
+                                        "args": json.dumps(tool_call["args"]),
+                                        "id": block.id,
+                                        "index": 0,
+                                        "type": "tool_call_chunk",
+                                    }
+                                ],
+                                chunk_position="last",
+                            )
+                        )
+                        if run_manager:
+                            await run_manager.on_llm_new_token("", chunk=chunk)
+                        yield chunk
+                    elif (
+                        isinstance(block, ToolUseBlock)
+                        and output_format is not None
+                        and block.name == "StructuredOutput"
+                    ):
+                        ignore_assistant_text = True
                     elif hasattr(block, "text"):
+                        if ignore_assistant_text:
+                            continue
                         text = block.text
                         additional_kwargs: dict[str, Any] = {}
                         if thinking_blocks:
@@ -621,6 +896,9 @@ class ChatClaudeAgSDK(BaseChatModel):
                         if run_manager:
                             await run_manager.on_llm_new_token(text, chunk=chunk)
                         yield chunk
+            elif isinstance(message, UserMessage):
+                if ignore_assistant_text:
+                    continue
             elif isinstance(message, ResultMessage):
                 usage = map_sdk_usage(message.usage)
                 if usage:

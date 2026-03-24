@@ -12,8 +12,9 @@ from claude_agent_sdk.types import (
     StreamEvent,
     TextBlock,
     ThinkingBlock,
+    ToolUseBlock,
 )
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool as lc_tool
 from pydantic import BaseModel
 
@@ -63,6 +64,31 @@ def _make_assistant_message_with_thinking(
         ],
         model="sonnet",
     )
+
+
+def _make_assistant_message_with_tool_use(
+    name: str,
+    args: dict[str, object],
+    *,
+    tool_use_id: str = "toolu_123",
+    text: str | None = None,
+) -> AssistantMessage:
+    """Create an SDK AssistantMessage with an optional preamble and tool use.
+
+    Args:
+        name: The SDK tool name.
+        args: Tool arguments.
+        tool_use_id: The SDK tool use identifier.
+        text: Optional assistant text preceding the tool call.
+
+    Returns:
+        An ``AssistantMessage`` containing a ``ToolUseBlock``.
+    """
+    content = []
+    if text:
+        content.append(TextBlock(text=text))
+    content.append(ToolUseBlock(id=tool_use_id, name=name, input=args))
+    return AssistantMessage(content=content, model="sonnet")
 
 
 def _make_result_message(
@@ -451,6 +477,57 @@ class TestChatClaudeAgSDKGenerate:
         ai_msg = result.generations[0].message
         assert json.loads(ai_msg.content) == structured
 
+    @pytest.mark.asyncio
+    async def test_agenerate_multimodal_uses_query_streaming_prompt(self):
+        """Multimodal inputs should be passed to query() as streaming messages."""
+        captured_kwargs = {}
+
+        async def _mock_query(**kwargs):
+            captured_kwargs.update(kwargs)
+            yield _make_assistant_message("This is an ant.")
+            yield _make_result_message()
+
+        agent = ChatClaudeAgSDK()
+        messages = [
+            HumanMessage(
+                content=[
+                    {
+                        "type": "image",
+                        "source_type": "base64",
+                        "mime_type": "image/png",
+                        "data": "ZmFrZS1wbmc=",
+                    },
+                    {"type": "text", "text": "What do you see?"},
+                ]
+            )
+        ]
+
+        with patch(_PATCH_QUERY, side_effect=_mock_query):
+            result = await agent._agenerate(messages)
+
+        prompt_messages = [msg async for msg in captured_kwargs["prompt"]]
+
+        assert result.generations[0].message.content == "This is an ant."
+        assert prompt_messages == [
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "ZmFrZS1wbmc=",
+                            },
+                        },
+                        {"type": "text", "text": "What do you see?"},
+                    ],
+                },
+            }
+        ]
+
 
 # ---------------------------------------------------------------------------
 # TestChatClaudeAgSDKTools
@@ -480,6 +557,160 @@ class TestChatClaudeAgSDKTools:
         assert "tools" in bound.kwargs
         assert bound.kwargs["tools"] == [add]
 
+    def test_bind_tools_stores_tool_choice_in_kwargs(self):
+        """bind_tools should preserve tool_choice on the runnable."""
+        llm = ChatClaudeAgSDK()
+        bound = llm.bind_tools([add], tool_choice="add")
+        assert bound.kwargs["tool_choice"] == "add"
+
+    @pytest.mark.asyncio
+    async def test_agenerate_tool_strategy_first_turn_hides_schema_tool(self):
+        """First tool turn should expose only user tools, not schema tools."""
+        llm = ChatClaudeAgSDK()
+        captured_kwargs = {}
+        structured_tool = MagicMock()
+        structured_tool.name = "WeatherReport"
+        structured_tool.description = ""
+        structured_tool.args_schema = {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+        }
+        structured_tool.ainvoke = AsyncMock(return_value={"city": "London"})
+
+        async def mock_query(**kwargs):
+            captured_kwargs.update(kwargs)
+            yield _make_assistant_message("Working on it.")
+            yield _make_result_message()
+
+        with (
+            patch(_PATCH_QUERY, side_effect=mock_query),
+            patch(_PATCH_TOOL_DECORATOR, side_effect=lambda n, d, s: lambda fn: fn),
+            patch(_PATCH_MCP_SERVER, return_value=MagicMock()),
+        ):
+            await llm._agenerate(
+                [HumanMessage(content="Return structured weather data.")],
+                tools=[add, structured_tool],
+                tool_choice="any",
+            )
+
+        assert captured_kwargs["options"].allowed_tools == ["mcp__langchain-tools__add"]
+
+    @pytest.mark.asyncio
+    async def test_agenerate_tool_strategy_followup_only_exposes_schema_tool(self):
+        """After tool results, only the schema tool should be exposed."""
+        llm = ChatClaudeAgSDK()
+        captured_kwargs = {}
+        structured_tool = MagicMock()
+        structured_tool.name = "WeatherReport"
+        structured_tool.description = ""
+        structured_tool.args_schema = {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "forecast": {"type": "string"},
+            },
+        }
+        structured_tool.ainvoke = AsyncMock(
+            return_value={"city": "London", "forecast": "Cloudy, 11 C"}
+        )
+
+        async def mock_query(**kwargs):
+            captured_kwargs.update(kwargs)
+            yield _make_assistant_message("Now formatting the result.")
+            yield _make_result_message()
+
+        with (
+            patch(_PATCH_QUERY, side_effect=mock_query),
+            patch(_PATCH_TOOL_DECORATOR, side_effect=lambda n, d, s: lambda fn: fn),
+            patch(_PATCH_MCP_SERVER, return_value=MagicMock()),
+        ):
+            await llm._agenerate(
+                [
+                    HumanMessage(content="Return structured weather data."),
+                    ToolMessage(
+                        content="Cloudy, 11 C",
+                        tool_call_id="call_1",
+                        name="add",
+                    ),
+                ],
+                tools=[add, structured_tool],
+                tool_choice="any",
+            )
+
+        assert captured_kwargs["options"].allowed_tools == [
+            "mcp__langchain-tools__WeatherReport"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_agenerate_tool_strategy_coerces_array_fields(self):
+        """Structured-output tool args should be coerced to the declared schema."""
+        llm = ChatClaudeAgSDK()
+        structured_tool = MagicMock()
+        structured_tool.name = "WeatherReport"
+        structured_tool.description = ""
+        structured_tool.args_schema = {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "forecast": {"type": "string"},
+                "alerts": {"type": "array", "items": {"type": "string"}},
+                "confidence": {"type": "string"},
+            },
+        }
+        structured_tool.ainvoke = AsyncMock(
+            return_value={
+                "city": "London",
+                "forecast": "Cloudy, 11 C",
+                "alerts": [],
+                "confidence": "high",
+            }
+        )
+
+        async def mock_query(**kwargs):
+            del kwargs
+            yield _make_assistant_message_with_tool_use(
+                "mcp__langchain-tools__WeatherReport",
+                {
+                    "city": "London",
+                    "forecast": "Cloudy, 11 C",
+                    "alerts": "No weather alerts",
+                    "confidence": "high",
+                },
+            )
+            yield _make_result_message()
+
+        with (
+            patch(_PATCH_QUERY, side_effect=mock_query),
+            patch(_PATCH_TOOL_DECORATOR, side_effect=lambda n, d, s: lambda fn: fn),
+            patch(_PATCH_MCP_SERVER, return_value=MagicMock()),
+        ):
+            result = await llm._agenerate(
+                [
+                    HumanMessage(content="Return structured weather data."),
+                    ToolMessage(
+                        content="Cloudy, 11 C",
+                        tool_call_id="call_1",
+                        name="add",
+                    ),
+                ],
+                tools=[add, structured_tool],
+                tool_choice="any",
+            )
+
+        assert result.generations[0].message.tool_calls == [
+            {
+                "name": "WeatherReport",
+                "args": {
+                    "city": "London",
+                    "forecast": "Cloudy, 11 C",
+                    "alerts": [],
+                    "confidence": "high",
+                },
+                "id": "toolu_123",
+                "type": "tool_call",
+            }
+        ]
+
     @pytest.mark.asyncio
     async def test_agenerate_with_tools_attaches_mcp_server(self):
         """_agenerate with tools should attach MCP server to options and call query()."""
@@ -506,6 +737,7 @@ class TestChatClaudeAgSDKTools:
         options = captured_kwargs["options"]
         assert "langchain-tools" in options.mcp_servers
         assert options.mcp_servers["langchain-tools"] is mock_mcp
+        assert options.hooks["PreToolUse"][0].matcher == "mcp__langchain-tools__add"
 
     @pytest.mark.asyncio
     async def test_agenerate_with_tools_returns_usage(self):
@@ -553,6 +785,124 @@ class TestChatClaudeAgSDKTools:
         options = captured_kwargs["options"]
         assert "mcp__langchain-tools__add" in options.allowed_tools
         assert "Read" in options.allowed_tools
+
+    @pytest.mark.asyncio
+    async def test_agenerate_with_tool_choice_none_skips_bound_tools(self):
+        """tool_choice='none' should not expose bound tools to Claude."""
+        llm = ChatClaudeAgSDK(allowed_tools=["Read"])
+        captured_kwargs = {}
+
+        async def mock_query(**kwargs):
+            captured_kwargs.update(kwargs)
+            yield _make_assistant_message("No tools needed.")
+            yield _make_result_message()
+
+        with (
+            patch(_PATCH_QUERY, side_effect=mock_query),
+            patch(_PATCH_TOOL_DECORATOR, side_effect=lambda n, d, s: lambda fn: fn),
+            patch(_PATCH_MCP_SERVER, return_value=MagicMock()),
+        ):
+            result = await llm._agenerate(
+                [HumanMessage(content="Say hello")],
+                tools=[add],
+                tool_choice="none",
+            )
+
+        assert result.generations[0].message.content == "No tools needed."
+        options = captured_kwargs["options"]
+        assert options.allowed_tools == ["Read"]
+        assert not options.mcp_servers
+
+    @pytest.mark.asyncio
+    async def test_agenerate_with_tool_use_returns_langchain_tool_calls(self):
+        """SDK ToolUseBlocks should be mapped to AIMessage.tool_calls."""
+        llm = ChatClaudeAgSDK()
+        captured_kwargs = {}
+
+        async def mock_query(**kwargs):
+            captured_kwargs.update(kwargs)
+            yield _make_assistant_message_with_tool_use(
+                "mcp__langchain-tools__add",
+                {"a": 3, "b": 4},
+                tool_use_id="toolu_abc",
+                text="I'll calculate that.",
+            )
+            yield _make_result_message()
+
+        with (
+            patch(_PATCH_QUERY, side_effect=mock_query),
+            patch(_PATCH_TOOL_DECORATOR, side_effect=lambda n, d, s: lambda fn: fn),
+            patch(_PATCH_MCP_SERVER, return_value=MagicMock()),
+        ):
+            result = await llm._agenerate(
+                [HumanMessage(content="What is 3 + 4?")],
+                tools=[add],
+            )
+
+        ai_msg = result.generations[0].message
+        assert ai_msg.content == "I'll calculate that."
+        assert ai_msg.tool_calls == [
+            {
+                "name": "add",
+                "args": {"a": 3, "b": 4},
+                "id": "toolu_abc",
+                "type": "tool_call",
+            }
+        ]
+        assert captured_kwargs["options"].hooks["PreToolUse"][0].matcher == (
+            "mcp__langchain-tools__add"
+        )
+
+    @pytest.mark.asyncio
+    async def test_agenerate_with_tools_serializes_tool_history_in_prompt(self):
+        """Tool history should be serialized into the query transcript."""
+        llm = ChatClaudeAgSDK()
+        captured_kwargs = {}
+        messages = [
+            HumanMessage(content="What is 3 + 4?"),
+            AIMessage(
+                content="I'll calculate that.",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 3, "b": 4},
+                        "id": "call_1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(content="7", tool_call_id="call_1", name="add"),
+        ]
+
+        async def mock_query(**kwargs):
+            captured_kwargs.update(kwargs)
+            yield _make_assistant_message("The answer is 7.")
+            yield _make_result_message()
+
+        with (
+            patch(_PATCH_QUERY, side_effect=mock_query),
+            patch(_PATCH_TOOL_DECORATOR, side_effect=lambda n, d, s: lambda fn: fn),
+            patch(_PATCH_MCP_SERVER, return_value=MagicMock()),
+        ):
+            result = await llm._agenerate(messages, tools=[add])
+
+        prompt_messages = [msg async for msg in captured_kwargs["prompt"]]
+
+        assert result.generations[0].message.content == "The answer is 7."
+        assert prompt_messages == [
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "Human: What is 3 + 4?\n"
+                        "Assistant: I'll calculate that.\n"
+                        'Assistant Tool Call (add) [call_1]: {"a": 3, "b": 4}\n'
+                        "Tool Result (add) [call_1]: 7"
+                    ),
+                },
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_agenerate_without_tools_has_no_mcp(self):
@@ -713,6 +1063,100 @@ class TestChatClaudeAgSDKStream:
         thinking = text_chunks[0].message.additional_kwargs["thinking"]
         assert thinking[0]["thinking"] == "Deep thought..."
 
+    @pytest.mark.asyncio
+    async def test_astream_with_tool_use_yields_tool_call_chunk(self):
+        """ToolUseBlocks should stream out as LangChain tool call chunks."""
+        llm = ChatClaudeAgSDK()
+
+        async def mock_query(*args, **kwargs):
+            yield _make_assistant_message_with_tool_use(
+                "mcp__langchain-tools__add",
+                {"a": 2, "b": 3},
+                tool_use_id="toolu_stream",
+                text="I'll calculate that.",
+            )
+            yield _make_result_message()
+
+        with (
+            patch(_PATCH_QUERY, mock_query),
+            patch(_PATCH_TOOL_DECORATOR, side_effect=lambda n, d, s: lambda fn: fn),
+            patch(_PATCH_MCP_SERVER, return_value=MagicMock()),
+        ):
+            chunks = []
+            async for chunk in llm._astream(
+                [HumanMessage(content="What is 2 + 3?")],
+                tools=[add],
+            ):
+                chunks.append(chunk)
+
+        text_chunks = [chunk for chunk in chunks if chunk.message.content]
+        tool_chunks = [chunk for chunk in chunks if chunk.message.tool_calls]
+
+        assert text_chunks[0].message.content == "I'll calculate that."
+        assert tool_chunks[0].message.tool_calls == [
+            {
+                "name": "add",
+                "args": {"a": 2, "b": 3},
+                "id": "toolu_stream",
+                "type": "tool_call",
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_astream_multimodal_uses_query_streaming_prompt(self):
+        """Streaming multimodal inputs should still flow through query()."""
+        llm = ChatClaudeAgSDK()
+        captured_kwargs = {}
+        messages = [
+            HumanMessage(
+                content=[
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/jpeg;base64,YW50LWltYWdl"
+                        },
+                    },
+                    {"type": "text", "text": "Describe this image."},
+                ]
+            )
+        ]
+
+        async def mock_query(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            yield _make_assistant_message("An ant on a stem.")
+            yield _make_result_message()
+
+        with patch(_PATCH_QUERY, mock_query):
+            chunks = []
+            async for chunk in llm._astream(messages):
+                chunks.append(chunk)
+
+        prompt_messages = [msg async for msg in captured_kwargs["prompt"]]
+        text_chunks = [chunk for chunk in chunks if chunk.message.content]
+
+        assert "".join(chunk.message.content for chunk in text_chunks) == (
+            "An ant on a stem."
+        )
+        assert prompt_messages == [
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": "YW50LWltYWdl",
+                            },
+                        },
+                        {"type": "text", "text": "Describe this image."},
+                    ],
+                },
+            }
+        ]
+
 
 # ---------------------------------------------------------------------------
 # TestSchemaToOutputFormat
@@ -760,3 +1204,56 @@ class TestWithStructuredOutput:
         chain = llm.with_structured_output(_TestModel)
         assert hasattr(chain, "invoke")
         assert hasattr(chain, "ainvoke")
+
+    @pytest.mark.asyncio
+    async def test_agenerate_output_format_ignores_internal_sdk_tool_use_blocks(self):
+        """Internal SDK tools should not surface as LangChain tool calls."""
+        llm = ChatClaudeAgSDK()
+
+        async def mock_query(**kwargs):
+            del kwargs
+            yield _make_assistant_message_with_tool_use(
+                "Read",
+                {"file_path": "README.md"},
+                text="I'll inspect the package first.",
+            )
+            yield _make_assistant_message_with_tool_use(
+                "StructuredOutput",
+                {"name": "langchain-claude-agent", "age": 1},
+            )
+            yield _make_result_message()
+
+        with patch(_PATCH_QUERY, side_effect=mock_query):
+            result = await llm._agenerate(
+                [HumanMessage(content="Describe the package as structured JSON.")],
+                output_format=_schema_to_output_format(_TestModel),
+            )
+
+        ai_msg = result.generations[0].message
+        assert ai_msg.tool_calls == []
+        assert json.loads(ai_msg.content) == {"name": "langchain-claude-agent", "age": 1}
+
+    def test_with_structured_output_invoke_parses_sdk_structured_output(self):
+        """with_structured_output should parse SDK StructuredOutput tool uses."""
+        llm = ChatClaudeAgSDK()
+        chain = llm.with_structured_output(_TestModel)
+
+        async def mock_query(**kwargs):
+            del kwargs
+            yield _make_assistant_message_with_tool_use(
+                "Read",
+                {"file_path": "README.md"},
+                text="I'll inspect the package first.",
+            )
+            yield _make_assistant_message_with_tool_use(
+                "StructuredOutput",
+                {"name": "langchain-claude-agent", "age": 1},
+            )
+            yield _make_result_message()
+
+        with patch(_PATCH_QUERY, side_effect=mock_query):
+            summary = chain.invoke("Describe the package as structured JSON.")
+
+        assert isinstance(summary, _TestModel)
+        assert summary.name == "langchain-claude-agent"
+        assert summary.age == 1

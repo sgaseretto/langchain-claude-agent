@@ -33,10 +33,11 @@ for chunk in llm.stream("Tell me a story"):
 
 ## With LangChain Tools
 
-Tools are executed autonomously by the Claude Agent SDK:
+Bound LangChain tools are surfaced as standard LangChain tool calls:
 
 ```python
 from langchain_core.tools import tool
+from langchain_core.messages import ToolMessage
 
 @tool
 def get_weather(city: str) -> str:
@@ -44,8 +45,21 @@ def get_weather(city: str) -> str:
     return f"Sunny in {city}"
 
 llm_with_tools = llm.bind_tools([get_weather])
-response = llm_with_tools.invoke("What's the weather in Paris?")
-print(response.content)
+ai_msg = llm_with_tools.invoke("What's the weather in Paris?")
+
+tool_result = get_weather.invoke(ai_msg.tool_calls[0]["args"])
+final = llm_with_tools.invoke(
+    [
+        ("human", "What's the weather in Paris?"),
+        ai_msg,
+        ToolMessage(
+            content=tool_result,
+            tool_call_id=ai_msg.tool_calls[0]["id"],
+            name="get_weather",
+        ),
+    ]
+)
+print(final.content)
 ```
 
 ## With SDK Built-in Tools
@@ -154,12 +168,25 @@ print(f"Credentials: {ok} - {message}")
 `ChatClaudeAgSDK` extends LangChain's `BaseChatModel` using the SDK's `query()` function for all generation paths:
 
 - **Basic calls** (`invoke`, `stream`): Calls `query()` with the converted messages
-- **Tool calls** (`bind_tools().invoke()`): Converts LangChain tools to an in-process MCP server and passes it via `ClaudeAgentOptions.mcp_servers` to `query()`
+- **Tool calls** (`bind_tools().invoke()`): Converts LangChain tools to an in-process MCP server, maps SDK tool-use blocks back to LangChain `tool_calls`, and expects `ToolMessage` follow-up inputs
 - **Structured output** (`with_structured_output()`): Uses the SDK's native `output_format` option for constrained JSON generation
 - **Extended thinking**: Passes `thinking` config to `ClaudeAgentOptions`; thinking blocks are returned in `additional_kwargs["thinking"]`
 
-The SDK handles tool execution autonomously -- when tools are bound, Claude decides when and how to use them, executes them, and returns the final result. This means LangGraph's `ToolNode` is not needed; the model handles the entire tool loop internally.
+SDK built-in tools remain autonomous. Bound LangChain tools behave like a normal chat-model provider so they can participate in standard LangChain and LangGraph tool loops.
 
-## Notebook
+## Notebooks
 
-See [`notebooks/features.ipynb`](notebooks/features.ipynb) for a comprehensive feature demo covering all capabilities.
+Install the notebook dependencies first:
+
+```bash
+uv sync --extra dev
+```
+
+The repository includes a small numbered notebook suite:
+
+- [`notebooks/00_features.ipynb`](notebooks/00_features.ipynb): Core chat-model features, tool calling, structured output, and multimodal input
+- [`notebooks/01_react_agent_weather.ipynb`](notebooks/01_react_agent_weather.ipynb): A LangChain `create_agent(...)` weather agent
+- [`notebooks/02_react_agent_weather_structured_output.ipynb`](notebooks/02_react_agent_weather_structured_output.ipynb): The same weather agent with structured output
+- [`notebooks/03_react_agent_weather_mcp.ipynb`](notebooks/03_react_agent_weather_mcp.ipynb): A weather agent powered by MCP tools
+
+[`notebooks/features.ipynb`](notebooks/features.ipynb) remains as a compact feature demo and mirrors `00_features.ipynb`.

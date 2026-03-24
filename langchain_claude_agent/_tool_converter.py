@@ -43,11 +43,37 @@ class SDKToolSpec:
     handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
+def _get_json_schema(tool: BaseTool) -> dict[str, Any]:
+    """Return a JSON-schema mapping for a LangChain tool input.
+
+    Args:
+        tool: A LangChain ``BaseTool`` instance.
+
+    Returns:
+        A JSON-schema dictionary describing the tool input.
+    """
+    args_schema = tool.args_schema
+    if args_schema is None:
+        return {}
+
+    if isinstance(args_schema, dict):
+        return args_schema
+
+    if hasattr(args_schema, "model_json_schema"):
+        return args_schema.model_json_schema()
+
+    input_schema = tool.get_input_schema()
+    if hasattr(input_schema, "model_json_schema"):
+        return input_schema.model_json_schema()
+
+    return {}
+
+
 def get_tool_schema(lc_tool: BaseTool) -> dict[str, type]:
     """Extract a simple type-mapping schema from a LangChain tool.
 
-    Uses ``lc_tool.args_schema.model_json_schema()`` when available and
-    maps JSON-schema type strings to Python types.
+    Uses the tool's JSON schema when available and maps JSON-schema type
+    strings to Python types.
 
     Args:
         lc_tool: A LangChain BaseTool instance.
@@ -56,10 +82,7 @@ def get_tool_schema(lc_tool: BaseTool) -> dict[str, type]:
         A dict mapping parameter names to Python types, e.g.
         ``{"a": int, "b": int}``.
     """
-    if lc_tool.args_schema is None:
-        return {}
-
-    json_schema = lc_tool.args_schema.model_json_schema()
+    json_schema = _get_json_schema(lc_tool)
     properties: dict[str, Any] = json_schema.get("properties", {})
 
     result: dict[str, type] = {}

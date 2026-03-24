@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 from langchain_core.tools import tool as lc_tool
 
 from langchain_claude_agent._tool_converter import (
@@ -45,6 +47,22 @@ class TestGetToolSchema:
         """String parameters should map to Python str."""
         schema = get_tool_schema(greet)
         assert schema == {"name": str}
+
+    def test_dict_args_schema(self):
+        """JSON-schema dict inputs should also be supported."""
+        fake_tool = MagicMock()
+        fake_tool.args_schema = {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "days": {"type": "integer"},
+            },
+        }
+        fake_tool.get_input_schema.return_value = None
+
+        schema = get_tool_schema(fake_tool)
+
+        assert schema == {"city": str, "days": int}
 
 
 # ---------------------------------------------------------------------------

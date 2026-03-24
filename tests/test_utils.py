@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from unittest.mock import patch
 
@@ -9,6 +10,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 
 from langchain_claude_agent._utils import (
     convert_messages_to_prompt,
+    convert_messages_to_sdk_streaming,
     extract_system_message,
     map_sdk_usage,
 )
@@ -79,13 +81,36 @@ class TestConvertMessages:
         result = convert_messages_to_prompt(msgs)
         assert result == "Human: hello\nAssistant: hi there"
 
+    def test_ai_message_tool_calls_are_included_in_prompt(self):
+        """AI tool calls should be preserved in the prompt transcript."""
+        msgs = [
+            AIMessage(
+                content="Let me calculate that.",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 2, "b": 3},
+                        "id": "call_1",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+
+        result = convert_messages_to_prompt(msgs)
+
+        assert result == (
+            'Assistant: Let me calculate that.\n'
+            'Assistant Tool Call (add) [call_1]: {"a": 2, "b": 3}'
+        )
+
     def test_tool_message(self):
         """A tool message with a name should include the name."""
         msgs = [
             ToolMessage(content="result data", name="search", tool_call_id="tc_1"),
         ]
         result = convert_messages_to_prompt(msgs)
-        assert result == "Tool Result (search): result data"
+        assert result == "Tool Result (search) [tc_1]: result data"
 
     def test_tool_message_without_name(self):
         """A tool message without a name should omit the parenthetical."""
@@ -93,7 +118,7 @@ class TestConvertMessages:
             ToolMessage(content="result data", tool_call_id="tc_1"),
         ]
         result = convert_messages_to_prompt(msgs)
-        assert result == "Tool Result: result data"
+        assert result == "Tool Result [tc_1]: result data"
 
     def test_empty_messages(self):
         """An empty message list should produce an empty string."""
@@ -108,6 +133,113 @@ class TestConvertMessages:
         ]
         result = convert_messages_to_prompt(msgs)
         assert result == "Human: hello"
+
+    def test_convert_messages_to_sdk_streaming_with_image_url(self):
+        """Data URI image_url blocks should be normalized for query()."""
+        msgs = [
+            HumanMessage(
+                content=[
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4="
+                        },
+                    },
+                    {"type": "text", "text": "Describe this image."},
+                ]
+            )
+        ]
+
+        result = convert_messages_to_sdk_streaming(msgs)
+
+        assert result == [
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/svg+xml",
+                                "data": "PHN2Zz48L3N2Zz4=",
+                            },
+                        },
+                        {"type": "text", "text": "Describe this image."},
+                    ],
+                },
+            }
+        ]
+
+    def test_convert_messages_to_sdk_streaming_with_base64_image_block(self):
+        """Base64 image blocks should be normalized for query()."""
+        msgs = [
+            HumanMessage(
+                content=[
+                    {
+                        "type": "image",
+                        "source_type": "base64",
+                        "mime_type": "image/png",
+                        "data": "ZmFrZS1wbmc=",
+                    },
+                    {"type": "text", "text": "What do you see?"},
+                ]
+            )
+        ]
+
+        result = convert_messages_to_sdk_streaming(msgs)
+
+        assert result == [
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "ZmFrZS1wbmc=",
+                            },
+                        },
+                        {"type": "text", "text": "What do you see?"},
+                    ],
+                },
+            }
+        ]
+
+    def test_convert_messages_to_sdk_streaming_flattens_ai_history_to_user_text(self):
+        """Assistant history should be serialized as user text for query()."""
+        msgs = [
+            AIMessage(
+                content="Calling the tool now.",
+                tool_calls=[
+                    {
+                        "name": "add",
+                        "args": {"a": 2, "b": 3},
+                        "id": "call_1",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+
+        result = convert_messages_to_sdk_streaming(msgs)
+
+        assert result == [
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "Assistant: Calling the tool now.\n"
+                        'Assistant Tool Call (add) [call_1]: {"a": 2, "b": 3}'
+                    ),
+                },
+            }
+        ]
 
 
 class TestMapUsage:
@@ -200,3 +332,23 @@ class TestCheckCredentials:
         assert len(result) == 2
         assert isinstance(result[0], bool)
         assert isinstance(result[1], str)
+
+    def test_probe_works_inside_running_event_loop(self):
+        """Credential probe should work inside notebook-style event loops."""
+        from langchain_claude_agent._utils import check_claude_agent_sdk_credentials
+
+        async def fake_query(prompt, options):
+            del prompt, options
+            if False:
+                yield None
+
+        async def _call_check():
+            return check_claude_agent_sdk_credentials()
+
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "claude_agent_sdk.query", fake_query
+        ):
+            ok, msg = asyncio.run(_call_check())
+
+        assert ok is True
+        assert "probe completed successfully" in msg
