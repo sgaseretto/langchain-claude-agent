@@ -2,16 +2,36 @@
 
 Use the Claude Agent SDK as an LLM provider in LangChain/LangGraph.
 
+> [!WARNING]
+> This project is intended for development and experimentation, not production agents. For production use, prefer the official `ChatAnthropic` integration. Behavior may break as new `claude-agent-sdk` releases land, so use this package at your own risk.
+
 ## Installation
 
+This package is not published to PyPI yet. Install it from Git and pin a tag or
+commit in production:
+
 ```bash
-uv add langchain-claude-agent
+uv add "git+https://github.com/sgaseretto/langchain-claude-agent.git@<tag-or-commit>"
 ```
 
-Or with pip:
+Commit the generated `uv.lock`, then use a frozen sync when deploying:
 
 ```bash
-pip install langchain-claude-agent
+uv sync --frozen
+```
+
+If you want to run this repository directly:
+
+```bash
+git clone https://github.com/sgaseretto/langchain-claude-agent.git
+cd langchain-claude-agent
+uv sync --frozen
+```
+
+For local development, tests, and notebooks:
+
+```bash
+uv sync --extra dev
 ```
 
 ## Quick Start
